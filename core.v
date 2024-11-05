@@ -16,6 +16,8 @@ module core (
     output wire [63:0] o_dmem_addr,
     output wire [63:0] o_dmem_wdata,
     input wire [63:0] i_dmem_rdata
+    // purely for debug introspection
+    // output wire [63 * 31:0] dbg_rdata,
 );
     // program counter control
     reg [63:0] pc;
@@ -39,6 +41,8 @@ module core (
     wire [31:0] imm;
     wire [2:0] funct3;
     wire op1_sel, op2_sel;
+    wire [3:0] alu_op;
+    wire [1:0] alu_mode;
     wire mem_read, mem_write;
     wire branch, jump;
     wire [2:0] rd_sel;
@@ -49,6 +53,7 @@ module core (
         .o_imm(imm),
         .o_funct3(funct3),
         .o_op1_sel(op1_sel), .o_op2_sel(op2_sel),
+        .o_alu_op(alu_op), .o_alu_mode(alu_mode),
         .o_mem_read(mem_read), .o_mem_write(mem_write),
         .o_branch(branch), .o_jump(jump), .o_rd_sel(rd_sel)
     );
@@ -64,15 +69,19 @@ module core (
         .o_rs1(rs1_data), .o_rs2(rs2_data)
     );
 
+    // assign dbg_rdata = rf.rdata;
+    // wire [63:0] rdata[31:1];
+    // genvar i;
+    // for (i = 1; i < 32; i = i + 1) assign rdata[i] = rf.rdata;
+
     wire [63:0] alu_op1 = op1_sel ? pc : rs1_data;
-    wire [63:0] alu_op2 = op2_sel ? imm : rs2_data;
+    wire [63:0] sext_imm = {{32{imm[31]}}, imm};
+    wire [63:0] alu_op2 = op2_sel ? sext_imm : rs2_data;
     wire [63:0] alu_result;
-    // wire alu_start = 1'b1;
-    // wire alu_done;
     alu alu (
-        // .i_clk(i_clk), .i_rst_n(i_rst_n),
-        .i_op1(alu_op1), .i_op2(alu_op2), // .i_start(alu_start),
-        .o_result(alu_result) //, .o_done(alu_done)
+        .i_op1(alu_op1), .i_op2(alu_op2),
+        .i_op(alu_op), .i_mode(alu_mode),
+        .o_result(alu_result)
     );
 
     // branch comparator
@@ -142,7 +151,7 @@ module register_file (
     wire [63:0] rdata[31:1];
     genvar i;
     generate
-        for (i = 1; i <= 31; i = i + 1) begin
+        for (i = 1; i < 32; i = i + 1) begin
             wire wen = i_wen && (i == i_rd);
             register entry (
                 .i_clk(i_clk), .i_rst_n(i_rst_n),
@@ -166,6 +175,8 @@ module decoder (
     output wire [2:0] o_funct3,
     output wire o_op1_sel, // selects between rs1 (0) and pc (1)
     output wire o_op2_sel, // selects between rs2 (0) and imm (1)
+    output wire [3:0] o_alu_op,   // selects between major operations of the alu
+    output wire [1:0] o_alu_mode, // selects between minor operations of the alu
     output wire o_mem_read,
     output wire o_mem_write,
     output wire o_branch,
@@ -179,6 +190,7 @@ module decoder (
     wire [2:0] funct3 = i_inst[14:12];
     wire [6:0] funct7 = i_inst[31:25];
 
+    // major opcode selection
     wire op_load     = opcode == 5'b00000;
     wire op_misc_mem = opcode == 5'b00011;
     wire op_op_imm   = opcode == 5'b00100;
@@ -194,8 +206,28 @@ module decoder (
     wire op_jal      = opcode == 5'b11011;
     wire op_system   = opcode == 5'b11100;
 
-    wire funct3_branch_valid = funct3[2:1] != 2'b01;
+    // branch funct3 selection
+    wire branch_eq  = funct3 == 3'b000;
+    wire branch_ne  = funct3 == 3'b001;
+    wire branch_lt  = funct3 == 3'b100;
+    wire branch_ge  = funct3 == 3'b101;
+    wire branch_ltu = funct3 == 3'b110;
+    wire branch_geu = funct3 == 3'b111;
 
+    // arithmetic (op, op_imm) funct3/funct7 selection
+    wire alu_funct7 = funct7 == 7'b0100000;
+    wire alu_add  = (funct3 == 3'b000) && !alu_funct7;
+    wire alu_sub  = (funct3 == 3'b000) && alu_funct7;
+    wire alu_sll  = (funct3 == 3'b001) && !alu_funct7;
+    wire alu_srl  = (funct3 == 3'b101) && !alu_funct7;
+    wire alu_sra  = (funct3 == 3'b101) && alu_funct7;
+    wire alu_slt  = (funct3 == 3'b010) && !alu_funct7;
+    wire alu_sltu = (funct3 == 3'b011) && !alu_funct7;
+    wire alu_xor  = (funct3 == 3'b100) && !alu_funct7;
+    wire alu_or   = (funct3 == 3'b110) && !alu_funct7;
+    wire alu_and  = (funct3 == 3'b111) && !alu_funct7;
+
+    // immediate decoding
     wire format_r = op_op;
     wire format_i = op_op_imm || op_jalr || op_load;
     wire format_s = op_store;
@@ -207,67 +239,75 @@ module decoder (
     wire format_ij = format_i | format_j;
     wire format_uj = format_u | format_j;
 
+    assign o_rs1 = rs1;
+    assign o_rs2 = rs2;
+    assign o_rd = rd;
+
     assign o_imm[0] = (format_s & i_inst[7]) | (format_i && i_inst[20]);
     assign o_imm[4:1] = ({4{format_sb}} & i_inst[11:8]) | ({4{format_ij}} & i_inst[24:21]);
-    assign o_imm[10:5] = {5{!format_u}} & i_inst[30:25];
+    assign o_imm[10:5] = {6{!format_u}} & i_inst[30:25];
     assign o_imm[11] = format_b ? i_inst[7] : (format_j ? i_inst[20] : (format_u ? 1'b0 : i_inst[31]));
     assign o_imm[19:12] = format_uj ? i_inst[19:12] : {8{i_inst[31]}};
     assign o_imm[30:20] = format_u ? i_inst[30:20] : {11{i_inst[31]}};
     assign o_imm[31] = i_inst[31];
 
-    assign o_op1_sel = 1'b0;
+    assign o_op1_sel = op_branch || op_auipc || op_jal;
     assign o_op2_sel = |{format_i, format_s, format_b, format_u, format_j};
+
+    assign o_alu_op[3] = alu_add || alu_sub || op_load || op_store || op_auipc || op_lui || op_branch || op_jal || op_jalr;
+    assign o_alu_op[2] = alu_sll || alu_srl || alu_sra;
+    assign o_alu_op[1] = alu_slt || alu_sltu;
+    assign o_alu_op[0] = alu_xor || alu_or || alu_and;
+    wire [1:0] shift_mode = alu_sll ? 2'b00 : (alu_srl ? 2'b01 : 2'b10);
+    assign o_alu_mode = o_alu_op[2] ? shift_mode : {1'b0, alu_funct7};
 
     assign o_mem_read = op_load;
     assign o_mem_write = op_store;
+
     assign o_branch = op_branch;
     assign o_jump = op_jal || op_jalr;
+
     assign o_rd_wen = format_r || format_i || format_u || format_j;
     assign o_rd_sel[0] = format_r || format_u || op_op_imm;
     assign o_rd_sel[1] = op_load;
     assign o_rd_sel[2] = format_j;
+
+    wire branch_valid = branch_eq || branch_ne || branch_lt || branch_ge || branch_ltu || branch_geu;
+    wire alu_valid = alu_add || alu_sub || alu_sll || alu_srl || alu_sra || alu_slt || alu_sltu || alu_xor || alu_or || alu_and;
 endmodule
 
 module alu (
-    // input wire i_clk,
-    // input wire i_rst_n,
     input wire [63:0] i_op1,
     input wire [63:0] i_op2,
-    // input wire i_start,
-    output wire [63:0] o_result,
-    output wire o_done
+    // add, shift, slt, bool
+    input wire [3:0] i_op,
+    input wire [1:0] i_mode,
+    output wire [63:0] o_result
 );
-    assign o_done = 1'b1;
-    // localparam idle = 2'b00;
+    // addition/subtraction
+    wire sub = i_mode[0];
+    wire [63:0] add_result = i_op1 + (i_op2 ^ {64{sub}}) + {63'h0, sub};
+    // sll/srl/sra
+    wire [5:0] shamt = i_op2[5:0];
+    wire sll = i_mode == 2'b00;
+    wire srl = i_mode == 2'b01;
+    wire sra = i_mode == 2'b10;
+    wire [63:0] shift_result = sll ? (i_op1 << shamt) :
+                               (srl ? (i_op1 >> shamt) :
+                               (sra ? ($signed(i_op1) >> shamt) : 64'h0));
+    // slt/sltu
+    wire sltu = i_mode[0];
+    wire lt = sltu ? (i_op1 < i_op2) : ($signed(i_op1) < $signed(i_op2));
+    wire [63:0] slt_result = {63'h0, lt};
+    // xor/or/and
+    wire [63:0] bool_result = ((i_op1 ^ i_op2) & ~{64{i_mode[0]}}) | ({64{i_mode[1]}} & i_op1 & i_op2);
 
-    // reg [1:0] state;
-    // reg done, next_done;
-    // reg [63:0] result, next_result;
-
-    // always @(*) begin
-    //     next_done = 1'b0;
-    //     next_result = 64'h0;
-    //
-    //     case (state)
-    //         idle: begin
-    //             if (i_start) begin
-    //                 next_done = 1'b1;
-    //                 next_result = i_op1 + i_op2;
-    //             end
-    //         end
-    //     endcase
-    // end
-    //
-    // always @(posedge i_clk, negedge i_rst_n) begin
-    //     if (!i_rst_n) begin
-    //         done <= 1'b0;
-    //         result <= 64'h0;
-    //     end else begin
-    //         done <= next_done;
-    //         result <= next_result;
-    //     end
-    // end
-
-    // assign o_done = done;
-    // assign o_result = next_result;
+    wire op_add = i_op[3];
+    wire op_shift = i_op[2];
+    wire op_slt = i_op[1];
+    wire op_bool = i_op[0];
+    assign o_result = op_add ? add_result :
+                      (op_shift ? shift_result :
+                      (op_slt ? slt_result :
+                      (op_bool ? bool_result : 64'h0)));
 endmodule

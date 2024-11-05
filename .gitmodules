@@ -1,0 +1,3 @@
+[submodule "riscv-formal"]
+	path = riscv-formal
+	url = https://github.com/SymbioticEDA/riscv-formal
