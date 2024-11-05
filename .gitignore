@@ -3,3 +3,4 @@ env/
 __pycache__/
 a.out
 results.xml
+obj_dir/
